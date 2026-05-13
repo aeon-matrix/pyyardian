@@ -1,33 +1,23 @@
 import aiohttp
 import asyncio
-import json
+from pyyardian.async_client import AsyncYardianClient
 
 async def main():
-    host = "192.168.1.103"
-    port = 880
-    token = "FCE25479"
+    host = "192.168.1.104"
+    token = "FCE25479" 
     
-    # We use the root URL because your successful curl used the root
-    url = f"http://{host}:{port}"
-    
-    # Matching your successful Git Bash headers exactly
-    headers = {
-        "Yardian-Token": token,
-        "Content-Type": "application/json"
-    }
-    
-    # Matching your successful stringified payload
-    payload = {
-        "sEvent": "AE_IRR_START_INST",
-        "sPayload": "[[-1, 0, 0, 0, 60]]"
-    }
-
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as response:
-            result = await response.json()
-            print(f"Status Code: {response.status}")
-            print(f"Response Body: {result}")
+        try:
+            cli = await AsyncYardianClient.create(session, host, token)
+            print(f"Starting irrigation on {cli.model_type.upper()}...")
+            await cli.start_irrigation(zone_id=0, duration=60)
+            print("Command Sent.")
+            
+            await asyncio.sleep(2)
+            active = await cli.fetch_active_zones()
+            print(f"Active Zones: {active}")
+        except Exception as e:
+            print(f"FAILED: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
