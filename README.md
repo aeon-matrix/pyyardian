@@ -1,1 +1,1 @@
- Python module for interacting with the Yardian irrigation controller. This module communicates directly towards the IP address of the Yardian device.
+ Python module for interacting with the Yardian smart irrigation controller. This module communicates directly towards the IP address of the Yardian controller.
