@@ -137,6 +137,20 @@ class AsyncYardianClient:
         else:
             await self._websession.post(self._base_url, headers=self._base_header, json={"sEvent": "AE_IRR_STOP_INST_TASK"})
 
+    async def stop_zone(self, zone_id: int):
+        """Stop irrigation for a specific zone."""
+        if self.model_type == "yc":
+            # For Standalone (YC): Find the specific task for this zone and stop it
+            tasks = await self.fetch_active_tasks_raw()
+            for t in tasks:
+                if t.get("output_id") == zone_id:
+                    stop_url = f"{self._base_url}/res/running-task/{t['id']}?action=stop"
+                    await self._websession.patch(stop_url, headers=self._base_header)
+                    break # Stop looking once we found and stopped the zone
+        else:
+            # For Regular (YP): API only supports global stop
+            await self.stop_irrigation()
+
     async def fetch_active_tasks_raw(self):
         """Internal helper for YC task ID management."""
         url = f"{self._base_url}/res/running-task"
