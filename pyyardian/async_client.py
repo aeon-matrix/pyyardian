@@ -1,3 +1,4 @@
+import logging
 import aiohttp
 import asyncio
 from dataclasses import dataclass
@@ -5,6 +6,8 @@ from dataclasses import dataclass
 from .const import MODEL_DETAIL, DEFAULT_TIMEOUT
 from .exceptions import NotAuthorizedException, NetworkException
 from .typing import DeviceInfo, OperationInfo
+
+_LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class YardianDeviceState:
@@ -14,7 +17,7 @@ class YardianDeviceState:
 
 class AsyncYardianClient:
     def __init__(
-        self, websession: aiohttp.ClientSession, host: str, 
+        self, websession: aiohttp.ClientSession, host: str,
         token: str = None, username: str = "admin", password: str = "1234"
     ) -> None:
         """Initialize the client. Use .create() for async auto-detection."""
@@ -24,7 +27,7 @@ class AsyncYardianClient:
         self._username = username  # YC default: admin
         self._password = password  # YC default: 1234
         self._base_url = f"http://{host}:880"
-        self._base_header = {}        
+        self._base_header = {}
         self._device_info = None
         self.model_type = "yp"
 
@@ -41,9 +44,9 @@ class AsyncYardianClient:
         try:
             async with self._websession.get(url, timeout=DEFAULT_TIMEOUT) as resp:
                 data = await resp.json(content_type=None)
-                
+
                 # Behavioral Detection: YP returns -1000 without token
-                if data.get("iCode") == -1000:
+                if data and data.get("iCode") == -1000:
                     self.model_type = "yp"
                     self._base_url = f"http://{self._host}:880"
                     self._base_header = {"Yardian-Token": self._token}
@@ -51,7 +54,7 @@ class AsyncYardianClient:
                     # YC allows discovery without token
                     self.model_type = "yc"
                     self._base_url = f"http://{self._host}:80"
-                    await self.login_yc() 
+                    await self.login_yc()
         except Exception as e:
             raise NetworkException(str(e))
 
@@ -61,7 +64,6 @@ class AsyncYardianClient:
         payload = {"user_id": self._username, "password": self._password}
         async with self._websession.post(url, json=payload, timeout=DEFAULT_TIMEOUT) as resp:
             if resp.status == 200:
-                # Handle text/plain JSON
                 result = await resp.json(content_type=None)
                 self._token = result["token"]
                 self._base_header = {"Authorization": f"Bearer {self._token}"}
@@ -74,7 +76,11 @@ class AsyncYardianClient:
         try:
             async with self._websession.get(url, headers=self._base_header, timeout=DEFAULT_TIMEOUT) as response:
                 resp = await response.json(content_type=None)
-                # Handle flat vs nested JSON
+
+                if resp is None:
+                    _LOGGER.error("Controller at %s returned empty response during info fetch", self._host)
+                    return {}
+
                 result = resp.get("result", resp)
                 model = result.get("model")
                 return result | MODEL_DETAIL.get(model, {})
@@ -86,6 +92,10 @@ class AsyncYardianClient:
         endpoint = "/res/controller" if self.model_type == "yc" else "/API_MGR_GET_OPERINFO"
         async with self._websession.get(f"{self._base_url}{endpoint}", headers=self._base_header) as response:
             resp = await response.json(content_type=None)
+
+            if resp is None:
+                _LOGGER.error("Controller at %s returned empty response during oper fetch", self._host)
+                return {}
             return resp.get("result", resp)
 
     async def fetch_active_zones(self):
@@ -93,6 +103,10 @@ class AsyncYardianClient:
         endpoint = "/res/running-task" if self.model_type == "yc" else "/API_ZONE_GET_OPENINGZONE"
         async with self._websession.get(f"{self._base_url}{endpoint}", headers=self._base_header) as response:
             resp = await response.json(content_type=None)
+
+            if resp is None:
+                return []
+
             if self.model_type == "yc":
                 return [task["output_id"] for task in resp]
             return resp.get("result", [])
@@ -118,13 +132,23 @@ class AsyncYardianClient:
         return YardianDeviceState(zones=zones, active_zones=set(active_zones))
 
     async def start_irrigation(self, zone_id, duration):
-        """Start irrigation with model-specific syntax."""
+        """Start irrigation with model-specific syntax. All durations are converted to seconds."""
+        # Convert the minutes provided by HA into seconds for the hardware
+        api_duration = duration * 60
+
         if self.model_type == "yc":
+            # Standalone C1 / YC Logic
             url = f"{self._base_url}/res/inst-program"
-            body = {"output_durs": [[zone_id, duration]], "store": False}
+            body = {"output_durs": [[zone_id, api_duration]], "store": False}
         else:
+            # Yardian Pro / YP Logic (Port 880)
+            # Even on YP, the 'Instant' payload expects seconds for precision
             url = self._base_url
-            body = {"sEvent": "AE_IRR_START_INST", "sPayload": f"[[-1, 0, 0, {zone_id}, {duration}]]"}
+            body = {
+                "sEvent": "AE_IRR_START_INST",
+                "sPayload": f"[[-1, 0, 0, {zone_id}, {api_duration}]]"
+            }
+
         await self._websession.post(url, headers=self._base_header, json=body)
 
     async def stop_irrigation(self):
@@ -140,15 +164,13 @@ class AsyncYardianClient:
     async def stop_zone(self, zone_id: int):
         """Stop irrigation for a specific zone."""
         if self.model_type == "yc":
-            # For Standalone (YC): Find the specific task for this zone and stop it
             tasks = await self.fetch_active_tasks_raw()
             for t in tasks:
                 if t.get("output_id") == zone_id:
                     stop_url = f"{self._base_url}/res/running-task/{t['id']}?action=stop"
                     await self._websession.patch(stop_url, headers=self._base_header)
-                    break # Stop looking once we found and stopped the zone
+                    break
         else:
-            # For Regular (YP): API only supports global stop
             await self.stop_irrigation()
 
     async def fetch_active_tasks_raw(self):
