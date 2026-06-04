@@ -2,4 +2,4 @@ from .async_client import AsyncYardianClient, YardianDeviceState
 from .exceptions import NotAuthorizedException, NetworkException
 from .typing import DeviceInfo, OperationInfo
 
-__version__ = "1.3.3"
+__version__ = "1.4.0"
