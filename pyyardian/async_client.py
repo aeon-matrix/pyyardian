@@ -9,76 +9,102 @@ from .typing import DeviceInfo, OperationInfo
 
 _LOGGER = logging.getLogger(__name__)
 
+
 @dataclass
 class YardianDeviceState:
     """Data retrieved from a Yardian device."""
+
     zones: list[list]
     active_zones: set[int]
 
+
 class AsyncYardianClient:
     def __init__(
-        self, websession: aiohttp.ClientSession, host: str,
-        token: str = None, username: str = "admin", password: str = "1234"
+        self,
+        websession: aiohttp.ClientSession,
+        host: str,
+        token: str = None,
     ) -> None:
         """Initialize the client. Use .create() for async auto-detection."""
         self._websession = websession
         self._host = host
-        self._token = token        # Static token for YP
-        self._username = username  # YC default: admin
-        self._password = password  # YC default: 1234
+        self._token = token  # Static token for YP
         self._base_url = f"http://{host}:880"
         self._base_header = {}
         self._device_info = None
         self.model_type = "yp"
 
     @classmethod
-    async def create(cls, websession: aiohttp.ClientSession, host: str, token: str = None, username: str = "admin", password: str = "1234"):
+    async def create(
+        cls,
+        websession: aiohttp.ClientSession,
+        host: str,
+        token: str = None,
+    ):
         """Asynchronous factory to create a client and auto-detect the model."""
-        client = cls(websession, host, token, username, password)
+        # FIX 1: Removed username and password from the class initialization
+        client = cls(websession, host, token)
         await client.detect_model()
         return client
 
     async def detect_model(self):
-        """Identify YP or YC by testing Port 880 auth behavior."""
+        """Identify YP or YC by reading the model string via API_GET_DEVICEINFO."""
+        # We now expect a token for both platforms
+        headers = {"Yardian-Token": self._token} if self._token else {}
         url = f"http://{self._host}:880/API_GET_DEVICEINFO"
+
         try:
-            async with self._websession.get(url, timeout=DEFAULT_TIMEOUT) as resp:
+            async with self._websession.get(
+                url, headers=headers, timeout=DEFAULT_TIMEOUT
+            ) as resp:
                 data = await resp.json(content_type=None)
 
-                # Behavioral Detection: YP returns -1000 without token
+                # Check if the device rejected the request (e.g., missing or invalid token)
                 if data and data.get("iCode") == -1000:
-                    self.model_type = "yp"
-                    self._base_url = f"http://{self._host}:880"
-                    self._base_header = {"Yardian-Token": self._token}
-                else:
-                    # YC allows discovery without token
+                    raise NotAuthorizedException("Invalid token or missing token.")
+
+                # Extract the model string (handle 'result' dictionary wrapping if present)
+                result = data.get("result", data)
+                model = result.get("model", "")
+
+                # Future-proof check: Is the last part a 'C' followed by a number? (e.g., C1, C2)
+                is_yc_model = (
+                    len(model) >= 2 and model[-2].upper() == "C" and model[-1].isdigit()
+                )
+
+                # FIX 2: Simplified logic completely for Option 1 (No login_yc fallback)
+                if is_yc_model:
                     self.model_type = "yc"
                     self._base_url = f"http://{self._host}:80"
-                    await self.login_yc()
+                else:
+                    self.model_type = "yp"
+                    self._base_url = f"http://{self._host}:880"
+
+                # Both YC and YP now use the exact same header format!
+                if self._token:
+                    self._base_header = {"Yardian-Token": self._token}
+                else:
+                    raise NotAuthorizedException("A token is required for all models.")
+
+        except NotAuthorizedException:
+            raise
         except Exception as e:
             raise NetworkException(str(e))
-
-    async def login_yc(self):
-        """Exchange YC credentials for a JWT."""
-        url = f"http://{self._host}:80/auth/login"
-        payload = {"user_id": self._username, "password": self._password}
-        async with self._websession.post(url, json=payload, timeout=DEFAULT_TIMEOUT) as resp:
-            if resp.status == 200:
-                result = await resp.json(content_type=None)
-                self._token = result["token"]
-                self._base_header = {"Authorization": f"Bearer {self._token}"}
-            else:
-                raise NotAuthorizedException(f"YC Login Failed: {resp.status}")
 
     async def fetch_device_info(self) -> DeviceInfo:
         """Fetch model info on Port 880."""
         url = f"http://{self._host}:880/API_GET_DEVICEINFO"
         try:
-            async with self._websession.get(url, headers=self._base_header, timeout=DEFAULT_TIMEOUT) as response:
+            async with self._websession.get(
+                url, headers=self._base_header, timeout=DEFAULT_TIMEOUT
+            ) as response:
                 resp = await response.json(content_type=None)
 
                 if resp is None:
-                    _LOGGER.error("Controller at %s returned empty response during info fetch", self._host)
+                    _LOGGER.error(
+                        "Controller at %s returned empty response during info fetch",
+                        self._host,
+                    )
                     return {}
 
                 result = resp.get("result", resp)
@@ -89,19 +115,32 @@ class AsyncYardianClient:
 
     async def fetch_oper_info(self) -> OperationInfo:
         """Route to correct info endpoint."""
-        endpoint = "/res/controller" if self.model_type == "yc" else "/API_MGR_GET_OPERINFO"
-        async with self._websession.get(f"{self._base_url}{endpoint}", headers=self._base_header) as response:
+        endpoint = (
+            "/res/controller" if self.model_type == "yc" else "/API_MGR_GET_OPERINFO"
+        )
+        async with self._websession.get(
+            f"{self._base_url}{endpoint}", headers=self._base_header
+        ) as response:
             resp = await response.json(content_type=None)
 
             if resp is None:
-                _LOGGER.error("Controller at %s returned empty response during oper fetch", self._host)
+                _LOGGER.error(
+                    "Controller at %s returned empty response during oper fetch",
+                    self._host,
+                )
                 return {}
             return resp.get("result", resp)
 
     async def fetch_active_zones(self):
         """Fetch currently running zone IDs."""
-        endpoint = "/res/running-task" if self.model_type == "yc" else "/API_ZONE_GET_OPENINGZONE"
-        async with self._websession.get(f"{self._base_url}{endpoint}", headers=self._base_header) as response:
+        endpoint = (
+            "/res/running-task"
+            if self.model_type == "yc"
+            else "/API_ZONE_GET_OPENINGZONE"
+        )
+        async with self._websession.get(
+            f"{self._base_url}{endpoint}", headers=self._base_header
+        ) as response:
             resp = await response.json(content_type=None)
 
             if resp is None:
@@ -114,7 +153,9 @@ class AsyncYardianClient:
     async def fetch_zone_info(self, amount=None):
         """Fetch zone metadata (names and status)."""
         if self.model_type == "yc":
-            async with self._websession.get(f"{self._base_url}/res/output-setting", headers=self._base_header) as resp:
+            async with self._websession.get(
+                f"{self._base_url}/res/output-setting", headers=self._base_header
+            ) as resp:
                 data = await resp.json(content_type=None)
                 zones = [[z["name"], 1, 0, 0] for z in data]
                 return zones[:amount] if amount else zones
@@ -146,7 +187,7 @@ class AsyncYardianClient:
             url = self._base_url
             body = {
                 "sEvent": "AE_IRR_START_INST",
-                "sPayload": f"[[-1, 0, 0, {zone_id}, {api_duration}]]"
+                "sPayload": f"[[-1, 0, 0, {zone_id}, {api_duration}]]",
             }
 
         await self._websession.post(url, headers=self._base_header, json=body)
@@ -159,7 +200,11 @@ class AsyncYardianClient:
                 stop_url = f"{self._base_url}/res/running-task/{t['id']}?action=stop"
                 await self._websession.patch(stop_url, headers=self._base_header)
         else:
-            await self._websession.post(self._base_url, headers=self._base_header, json={"sEvent": "AE_IRR_STOP_INST_TASK"})
+            await self._websession.post(
+                self._base_url,
+                headers=self._base_header,
+                json={"sEvent": "AE_IRR_STOP_INST_TASK"},
+            )
 
     async def stop_zone(self, zone_id: int):
         """Stop irrigation for a specific zone."""
@@ -167,7 +212,9 @@ class AsyncYardianClient:
             tasks = await self.fetch_active_tasks_raw()
             for t in tasks:
                 if t.get("output_id") == zone_id:
-                    stop_url = f"{self._base_url}/res/running-task/{t['id']}?action=stop"
+                    stop_url = (
+                        f"{self._base_url}/res/running-task/{t['id']}?action=stop"
+                    )
                     await self._websession.patch(stop_url, headers=self._base_header)
                     break
         else:
