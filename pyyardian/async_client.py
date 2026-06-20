@@ -114,22 +114,51 @@ class AsyncYardianClient:
             raise NetworkException()
 
     async def fetch_oper_info(self) -> OperationInfo:
-        """Route to correct info endpoint."""
-        endpoint = (
-            "/res/controller" if self.model_type == "yc" else "/API_MGR_GET_OPERINFO"
-        )
-        async with self._websession.get(
-            f"{self._base_url}{endpoint}", headers=self._base_header
-        ) as response:
-            resp = await response.json(content_type=None)
+        """Route to correct info endpoint and normalize data."""
+        if self.model_type == "yc":
+            # 1. Fetch main YC controller info
+            async with self._websession.get(
+                f"{self._base_url}/res/controller", headers=self._base_header
+            ) as response:
+                resp = await response.json(content_type=None)
+                if resp is None:
+                    _LOGGER.error(
+                        "Controller at %s returned empty response during oper fetch",
+                        self._host,
+                    )
+                    return {}
+                oper_info = resp.get("result", resp)
 
-            if resp is None:
-                _LOGGER.error(
-                    "Controller at %s returned empty response during oper fetch",
-                    self._host,
-                )
-                return {}
-            return resp.get("result", resp)
+            # 2. Fetch YC schedule settings to get standby state
+            try:
+                async with self._websession.get(
+                    f"{self._base_url}/res/sch-setting", headers=self._base_header
+                ) as sch_response:
+                    sch_resp = await sch_response.json(content_type=None)
+                    if sch_resp:
+                        # Translate YC boolean into YP epoch timestamp for HA Core
+                        # 2147483647 is max 32-bit epoch (Year 2038) to ensure it is always > current time
+                        oper_info["iStandby"] = 2147483647 if sch_resp.get("standby_mode") else 0
+            except Exception as e:
+                _LOGGER.warning("Failed to fetch YC schedule settings: %s", e)
+                oper_info["iStandby"] = 0
+
+            return oper_info
+
+        else:
+            # 3. Standard YP Logic (Already contains iStandby)
+            async with self._websession.get(
+                f"{self._base_url}/API_MGR_GET_OPERINFO", headers=self._base_header
+            ) as response:
+                resp = await response.json(content_type=None)
+
+                if resp is None:
+                    _LOGGER.error(
+                        "Controller at %s returned empty response during oper fetch",
+                        self._host,
+                    )
+                    return {}
+                return resp.get("result", resp)
 
     async def fetch_active_zones(self):
         """Fetch currently running zone IDs."""
