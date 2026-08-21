@@ -34,6 +34,7 @@ class AsyncYardianClient:
         self._base_header = {}
         self._device_info = None
         self.model_type = "yp"
+        self._lock = asyncio.Lock()  # ADDED: Enforce sequential API calls
 
     @classmethod
     async def create(
@@ -53,31 +54,31 @@ class AsyncYardianClient:
         url = f"http://{self._host}:880/API_GET_DEVICEINFO"
 
         try:
-            async with self._websession.get(
-                url, headers=headers, timeout=DEFAULT_TIMEOUT
-            ) as resp:
-                data = await resp.json(content_type=None)
+            async with self._lock:
+                async with self._websession.get(
+                    url, headers=headers, timeout=DEFAULT_TIMEOUT
+                ) as resp:
+                    data = await resp.json(content_type=None)
 
-                if data and data.get("iCode") == -1000:
-                    raise NotAuthorizedException("Invalid token or missing token.")
+            if data and data.get("iCode") == -1000:
+                raise NotAuthorizedException("Invalid token or missing token.")
 
-                result = data.get("result", data)
-                model = result.get("model", "")
+            result = data.get("result", data)
+            model = result.get("model", "")
 
-                # Fix 12-zone detection: Look for 'C' followed by any number of digits at the end
-                is_yc_model = bool(re.search(r"C\d+$", model.upper()))
+            is_yc_model = bool(re.search(r"C\d+$", model.upper()))
 
-                if is_yc_model:
-                    self.model_type = "yc"
-                    self._base_url = f"http://{self._host}:80"
-                else:
-                    self.model_type = "yp"
-                    self._base_url = f"http://{self._host}:880"
+            if is_yc_model:
+                self.model_type = "yc"
+                self._base_url = f"http://{self._host}:80"
+            else:
+                self.model_type = "yp"
+                self._base_url = f"http://{self._host}:880"
 
-                if self._token:
-                    self._base_header = {"Yardian-Token": self._token}
-                else:
-                    raise NotAuthorizedException("A token is required for all models.")
+            if self._token:
+                self._base_header = {"Yardian-Token": self._token}
+            else:
+                raise NotAuthorizedException("A token is required for all models.")
 
         except NotAuthorizedException:
             raise
@@ -88,42 +89,41 @@ class AsyncYardianClient:
         """Fetch model info on Port 880."""
         url = f"http://{self._host}:880/API_GET_DEVICEINFO"
         try:
-            async with self._websession.get(
-                url, headers=self._base_header, timeout=DEFAULT_TIMEOUT
-            ) as response:
-                resp = await response.json(content_type=None)
+            async with self._lock:
+                async with self._websession.get(
+                    url, headers=self._base_header, timeout=DEFAULT_TIMEOUT
+                ) as response:
+                    resp = await response.json(content_type=None)
 
-                if resp is None:
-                    _LOGGER.error(
-                        "Controller at %s returned empty response during info fetch",
-                        self._host,
-                    )
-                    return {}
+            if resp is None:
+                _LOGGER.error(
+                    "Controller at %s returned empty response during info fetch",
+                    self._host,
+                )
+                return {}
 
-                result = resp.get("result", resp)
-                model = result.get("model", "")
+            result = resp.get("result", resp)
+            model = result.get("model", "")
 
-                # 1. Try exact match first
-                model_info = MODEL_DETAIL.get(model)
+            model_info = MODEL_DETAIL.get(model)
 
-                # 2. If exact match fails, fallback to base model for zones, but fix the name
-                if not model_info:
-                    suffix_match = re.search(r"C\d+$", model.upper())
-                    if suffix_match:
-                        suffix = suffix_match.group()
-                        base_model = model.upper().replace(suffix, "")
-                        base_info = MODEL_DETAIL.get(base_model, {})
+            if not model_info:
+                suffix_match = re.search(r"C\d+$", model.upper())
+                if suffix_match:
+                    suffix = suffix_match.group()
+                    base_model = model.upper().replace(suffix, "")
+                    base_info = MODEL_DETAIL.get(base_model, {})
 
-                        if base_info:
-                            model_info = {
-                                "name": f"{base_info.get('name')} {suffix}",
-                                "zones": base_info.get("zones"),
-                            }
+                    if base_info:
+                        model_info = {
+                            "name": f"{base_info.get('name')} {suffix}",
+                            "zones": base_info.get("zones"),
+                        }
 
-                if not model_info:
-                    model_info = {}
+            if not model_info:
+                model_info = {}
 
-                return result | model_info
+            return result | model_info
 
         except Exception:
             raise NetworkException()
@@ -131,37 +131,42 @@ class AsyncYardianClient:
     async def fetch_oper_info(self) -> OperationInfo:
         """Route to correct info endpoint and normalize data."""
         if self.model_type == "yc":
-            async with self._websession.get(
-                f"{self._base_url}/res/controller", headers=self._base_header
-            ) as response:
-                resp = await response.json(content_type=None)
-                if resp is None:
-                    return {}
-                oper_info = resp.get("result", resp)
+            async with self._lock:
+                async with self._websession.get(
+                    f"{self._base_url}/res/controller", headers=self._base_header
+                ) as response:
+                    resp = await response.json(content_type=None)
+
+            if resp is None:
+                return {}
+            oper_info = resp.get("result", resp)
 
             try:
-                async with self._websession.get(
-                    f"{self._base_url}/res/sch-setting", headers=self._base_header
-                ) as sch_response:
-                    sch_resp = await sch_response.json(content_type=None)
-                    if sch_resp:
-                        oper_info["iStandby"] = (
-                            2147483647 if sch_resp.get("standby_mode") else 0
-                        )
+                async with self._lock:
+                    async with self._websession.get(
+                        f"{self._base_url}/res/sch-setting", headers=self._base_header
+                    ) as sch_response:
+                        sch_resp = await sch_response.json(content_type=None)
+
+                if sch_resp:
+                    oper_info["iStandby"] = (
+                        2147483647 if sch_resp.get("standby_mode") else 0
+                    )
             except Exception as e:
                 _LOGGER.warning("Failed to fetch YC schedule settings: %s", e)
                 oper_info["iStandby"] = 0
 
             return oper_info
         else:
-            async with self._websession.get(
-                f"{self._base_url}/API_MGR_GET_OPERINFO", headers=self._base_header
-            ) as response:
-                resp = await response.json(content_type=None)
+            async with self._lock:
+                async with self._websession.get(
+                    f"{self._base_url}/API_MGR_GET_OPERINFO", headers=self._base_header
+                ) as response:
+                    resp = await response.json(content_type=None)
 
-                if resp is None:
-                    return {}
-                return resp.get("result", resp)
+            if resp is None:
+                return {}
+            return resp.get("result", resp)
 
     async def fetch_active_zones(self):
         """Fetch currently running zone IDs."""
@@ -170,27 +175,31 @@ class AsyncYardianClient:
             if self.model_type == "yc"
             else "/API_ZONE_GET_OPENINGZONE"
         )
-        async with self._websession.get(
-            f"{self._base_url}{endpoint}", headers=self._base_header
-        ) as response:
-            resp = await response.json(content_type=None)
 
-            if resp is None:
-                return []
+        async with self._lock:
+            async with self._websession.get(
+                f"{self._base_url}{endpoint}", headers=self._base_header
+            ) as response:
+                resp = await response.json(content_type=None)
 
-            if self.model_type == "yc":
-                return [task["output_id"] for task in resp]
-            return resp.get("result", [])
+        if resp is None:
+            return []
+
+        if self.model_type == "yc":
+            return [task["output_id"] for task in resp]
+        return resp.get("result", [])
 
     async def fetch_zone_info(self, amount=None):
         """Fetch zone metadata (names and status)."""
         if self.model_type == "yc":
-            async with self._websession.get(
-                f"{self._base_url}/res/output-setting", headers=self._base_header
-            ) as resp:
-                data = await resp.json(content_type=None)
-                zones = [[z["name"], 1, 0, 0] for z in data]
-                return zones[:amount] if amount else zones
+            async with self._lock:
+                async with self._websession.get(
+                    f"{self._base_url}/res/output-setting", headers=self._base_header
+                ) as resp:
+                    data = await resp.json(content_type=None)
+
+            zones = [[z["name"], 1, 0, 0] for z in data]
+            return zones[:amount] if amount else zones
         else:
             oper_info = await self.fetch_oper_info()
             zones = oper_info.get("zones", [])
@@ -221,38 +230,47 @@ class AsyncYardianClient:
                 "sPayload": f"[[-1, 0, 0, {zone_id}, {api_duration}]]",
             }
 
-        await self._websession.post(url, headers=self._base_header, json=body)
+        async with self._lock:
+            await self._websession.post(url, headers=self._base_header, json=body)
 
     async def stop_irrigation(self):
         """Stop current irrigation."""
         if self.model_type == "yc":
             tasks = await self.fetch_active_tasks_raw()
-            for t in tasks:
-                stop_url = f"{self._base_url}/res/running-task/{t['id']}?action=stop"
-                await self._websession.patch(stop_url, headers=self._base_header)
+            async with self._lock:
+                for t in tasks:
+                    stop_url = (
+                        f"{self._base_url}/res/running-task/{t['id']}?action=stop"
+                    )
+                    await self._websession.patch(stop_url, headers=self._base_header)
         else:
-            await self._websession.post(
-                self._base_url,
-                headers=self._base_header,
-                json={"sEvent": "AE_IRR_STOP_INST_TASK"},
-            )
+            async with self._lock:
+                await self._websession.post(
+                    self._base_url,
+                    headers=self._base_header,
+                    json={"sEvent": "AE_IRR_STOP_INST_TASK"},
+                )
 
     async def stop_zone(self, zone_id: int):
         """Stop irrigation for a specific zone."""
         if self.model_type == "yc":
             tasks = await self.fetch_active_tasks_raw()
-            for t in tasks:
-                if t.get("output_id") == zone_id:
-                    stop_url = (
-                        f"{self._base_url}/res/running-task/{t['id']}?action=stop"
-                    )
-                    await self._websession.patch(stop_url, headers=self._base_header)
-                    break
+            async with self._lock:
+                for t in tasks:
+                    if t.get("output_id") == zone_id:
+                        stop_url = (
+                            f"{self._base_url}/res/running-task/{t['id']}?action=stop"
+                        )
+                        await self._websession.patch(
+                            stop_url, headers=self._base_header
+                        )
+                        break
         else:
             await self.stop_irrigation()
 
     async def fetch_active_tasks_raw(self):
         """Internal helper for YC task ID management."""
         url = f"{self._base_url}/res/running-task"
-        async with self._websession.get(url, headers=self._base_header) as resp:
-            return await resp.json(content_type=None) if resp.status == 200 else []
+        async with self._lock:
+            async with self._websession.get(url, headers=self._base_header) as resp:
+                return await resp.json(content_type=None) if resp.status == 200 else []
