@@ -1,6 +1,7 @@
 import logging
 import aiohttp
 import asyncio
+import re
 from dataclasses import dataclass
 
 from .const import MODEL_DETAIL, DEFAULT_TIMEOUT
@@ -28,7 +29,7 @@ class AsyncYardianClient:
         """Initialize the client. Use .create() for async auto-detection."""
         self._websession = websession
         self._host = host
-        self._token = token  # Static token for YP
+        self._token = token
         self._base_url = f"http://{host}:880"
         self._base_header = {}
         self._device_info = None
@@ -42,14 +43,12 @@ class AsyncYardianClient:
         token: str = None,
     ):
         """Asynchronous factory to create a client and auto-detect the model."""
-        # FIX 1: Removed username and password from the class initialization
         client = cls(websession, host, token)
         await client.detect_model()
         return client
 
     async def detect_model(self):
         """Identify YP or YC by reading the model string via API_GET_DEVICEINFO."""
-        # We now expect a token for both platforms
         headers = {"Yardian-Token": self._token} if self._token else {}
         url = f"http://{self._host}:880/API_GET_DEVICEINFO"
 
@@ -59,20 +58,15 @@ class AsyncYardianClient:
             ) as resp:
                 data = await resp.json(content_type=None)
 
-                # Check if the device rejected the request (e.g., missing or invalid token)
                 if data and data.get("iCode") == -1000:
                     raise NotAuthorizedException("Invalid token or missing token.")
 
-                # Extract the model string (handle 'result' dictionary wrapping if present)
                 result = data.get("result", data)
                 model = result.get("model", "")
 
-                # Future-proof check: Is the last part a 'C' followed by a number? (e.g., C1, C2)
-                is_yc_model = (
-                    len(model) >= 2 and model[-2].upper() == "C" and model[-1].isdigit()
-                )
+                # Fix 12-zone detection: Look for 'C' followed by any number of digits at the end
+                is_yc_model = bool(re.search(r"C\d+$", model.upper()))
 
-                # FIX 2: Simplified logic completely for Option 1 (No login_yc fallback)
                 if is_yc_model:
                     self.model_type = "yc"
                     self._base_url = f"http://{self._host}:80"
@@ -80,7 +74,6 @@ class AsyncYardianClient:
                     self.model_type = "yp"
                     self._base_url = f"http://{self._host}:880"
 
-                # Both YC and YP now use the exact same header format!
                 if self._token:
                     self._base_header = {"Yardian-Token": self._token}
                 else:
@@ -108,55 +101,65 @@ class AsyncYardianClient:
                     return {}
 
                 result = resp.get("result", resp)
-                model = result.get("model")
-                return result | MODEL_DETAIL.get(model, {})
+                model = result.get("model", "")
+
+                # 1. Try exact match first
+                model_info = MODEL_DETAIL.get(model)
+
+                # 2. If exact match fails, fallback to base model for zones, but fix the name
+                if not model_info:
+                    suffix_match = re.search(r"C\d+$", model.upper())
+                    if suffix_match:
+                        suffix = suffix_match.group()
+                        base_model = model.upper().replace(suffix, "")
+                        base_info = MODEL_DETAIL.get(base_model, {})
+
+                        if base_info:
+                            model_info = {
+                                "name": f"{base_info.get('name')} {suffix}",
+                                "zones": base_info.get("zones"),
+                            }
+
+                if not model_info:
+                    model_info = {}
+
+                return result | model_info
+
         except Exception:
             raise NetworkException()
 
     async def fetch_oper_info(self) -> OperationInfo:
         """Route to correct info endpoint and normalize data."""
         if self.model_type == "yc":
-            # 1. Fetch main YC controller info
             async with self._websession.get(
                 f"{self._base_url}/res/controller", headers=self._base_header
             ) as response:
                 resp = await response.json(content_type=None)
                 if resp is None:
-                    _LOGGER.error(
-                        "Controller at %s returned empty response during oper fetch",
-                        self._host,
-                    )
                     return {}
                 oper_info = resp.get("result", resp)
 
-            # 2. Fetch YC schedule settings to get standby state
             try:
                 async with self._websession.get(
                     f"{self._base_url}/res/sch-setting", headers=self._base_header
                 ) as sch_response:
                     sch_resp = await sch_response.json(content_type=None)
                     if sch_resp:
-                        # Translate YC boolean into YP epoch timestamp for HA Core
-                        # 2147483647 is max 32-bit epoch (Year 2038) to ensure it is always > current time
-                        oper_info["iStandby"] = 2147483647 if sch_resp.get("standby_mode") else 0
+                        oper_info["iStandby"] = (
+                            2147483647 if sch_resp.get("standby_mode") else 0
+                        )
             except Exception as e:
                 _LOGGER.warning("Failed to fetch YC schedule settings: %s", e)
                 oper_info["iStandby"] = 0
 
             return oper_info
-
         else:
-            # 3. Standard YP Logic (Already contains iStandby)
             async with self._websession.get(
                 f"{self._base_url}/API_MGR_GET_OPERINFO", headers=self._base_header
             ) as response:
                 resp = await response.json(content_type=None)
 
                 if resp is None:
-                    _LOGGER.error(
-                        "Controller at %s returned empty response during oper fetch",
-                        self._host,
-                    )
                     return {}
                 return resp.get("result", resp)
 
@@ -197,22 +200,21 @@ class AsyncYardianClient:
         """Unified state retrieval."""
         if not self._device_info:
             self._device_info = await self.fetch_device_info()
-        zones = await self.fetch_zone_info()
+
+        expected_zones = self._device_info.get("zones")
+        zones = await self.fetch_zone_info(amount=expected_zones)
+
         active_zones = await self.fetch_active_zones()
         return YardianDeviceState(zones=zones, active_zones=set(active_zones))
 
     async def start_irrigation(self, zone_id, duration):
-        """Start irrigation with model-specific syntax. All durations are converted to seconds."""
-        # Convert the minutes provided by HA into seconds for the hardware
+        """Start irrigation with model-specific syntax."""
         api_duration = duration * 60
 
         if self.model_type == "yc":
-            # Standalone C1 / YC Logic
             url = f"{self._base_url}/res/inst-program"
             body = {"output_durs": [[zone_id, api_duration]], "store": False}
         else:
-            # Yardian Pro / YP Logic (Port 880)
-            # Even on YP, the 'Instant' payload expects seconds for precision
             url = self._base_url
             body = {
                 "sEvent": "AE_IRR_START_INST",
